@@ -75,6 +75,7 @@ jobs:
           TPL
 
       - name: Run Trivy
+        id: trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
@@ -90,7 +91,22 @@ jobs:
       - name: Build report
         id: report
         if: always()
+        env:
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
         run: |
+          if [ "$TRIVY_OUTCOME" != success ]; then
+            echo "total=0" >> "$GITHUB_OUTPUT"
+            echo "critical=0" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Trivy report"
+              echo
+              echo "⚠️ Scan did not complete (${TRIVY_OUTCOME}). No result available."
+              echo
+              echo "_Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}_"
+            } > summary.md
+            cat summary.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           total=$(( $(grep -c '^|' trivy-report.md 2>/dev/null || echo 0) - 2 ))
           [ "$total" -lt 0 ] && total=0
           critical=$(grep -c '^| CRITICAL' trivy-report.md 2>/dev/null || true)
@@ -128,13 +144,14 @@ jobs:
           TOTAL: ${{ steps.report.outputs.total }}
           CRITICAL: ${{ steps.report.outputs.critical }}
           JOB_STATUS: ${{ job.status }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
         run: |
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
             echo "::notice::Telegram secrets not set, skipping notification."
             exit 0
           fi
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          if [ "$JOB_STATUS" != success ]; then
+          if [ "$JOB_STATUS" != success ] || [ "$TRIVY_OUTCOME" != success ]; then
             icon="⚠️"; text="scan failed to complete"
           elif [ "${TOTAL:-0}" -gt 0 ]; then
             icon="🔴"; text="${TOTAL} findings (${CRITICAL:-0} critical)"
