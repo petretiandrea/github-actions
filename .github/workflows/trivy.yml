@@ -1,0 +1,149 @@
+name: Trivy scan (reusable)
+
+# Scans a repository for Kubernetes/Helm misconfigurations and secrets, then
+# reports in the run summary, as a pull request comment, and optionally on
+# Telegram (scheduled and manual runs only).
+on:
+  workflow_call:
+    inputs:
+      scan-ref:
+        description: Path to scan, relative to the repository root.
+        type: string
+        default: .
+      severity:
+        description: Comma-separated severities to report.
+        type: string
+        default: HIGH,CRITICAL
+      telegram-event-names:
+        description: Caller events that send a Telegram notification.
+        type: string
+        default: schedule,workflow_dispatch
+    secrets:
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+      TELEGRAM_THREAD_ID:
+        required: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Cache Helm chart dependencies
+        id: helm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.scan-ref }}/**/charts
+          key: helm-deps-${{ hashFiles('**/Chart.yaml', '**/Chart.lock') }}
+
+      # Wrapper charts keep their real workloads in dependencies, which are
+      # usually not tracked in Git. Fetch them so Trivy renders complete charts.
+      - name: Fetch Helm chart dependencies
+        if: steps.helm-cache.outputs.cache-hit != 'true'
+        env:
+          SCAN_REF: ${{ inputs.scan-ref }}
+        run: |
+          set -u
+          grep -rhE '^[[:space:]]+repository:[[:space:]]*https?://' \
+            --include=Chart.yaml "$SCAN_REF" 2>/dev/null \
+            | sed -E 's/.*repository:[[:space:]]*//; s/["'"'"']//g' | sort -u \
+            | while read -r url; do
+                helm repo add "r-$(printf '%s' "$url" | cksum | cut -d' ' -f1)" "$url" >/dev/null
+              done
+          helm repo update >/dev/null 2>&1 || true
+
+          grep -rlE '^dependencies:' --include=Chart.yaml "$SCAN_REF" 2>/dev/null | while read -r chart; do
+            dir="$(dirname "$chart")"
+            helm dependency build "$dir" >/dev/null 2>&1 \
+              && echo "built $dir" \
+              || echo "::warning::helm dependency build failed for $dir"
+          done
+
+      - name: Write report template
+        run: |
+          cat > "$RUNNER_TEMP/trivy-markdown.tpl" <<'TPL'
+          | Severity | File | Line | ID | Title |
+          | --- | --- | --- | --- | --- |
+          {{ range . }}{{ $target := .Target }}{{ range .Misconfigurations }}| {{ .Severity }} | `{{ $target }}` | {{ .CauseMetadata.StartLine }} | {{ .ID }} | {{ .Title }} |
+          {{ end }}{{ range .Secrets }}| {{ .Severity }} | `{{ $target }}` | {{ .StartLine }} | {{ .RuleID }} | {{ .Title }} |
+          {{ end }}{{ end }}
+          TPL
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.scan-ref }}
+          scanners: misconfig,secret
+          severity: ${{ inputs.severity }}
+          format: template
+          template: '@${{ runner.temp }}/trivy-markdown.tpl'
+          output: trivy-report.md
+          hide-progress: true
+          exit-code: '0'
+
+      - name: Build report
+        id: report
+        if: always()
+        run: |
+          total=$(( $(grep -c '^|' trivy-report.md 2>/dev/null || echo 0) - 2 ))
+          [ "$total" -lt 0 ] && total=0
+          critical=$(grep -c '^| CRITICAL' trivy-report.md 2>/dev/null || true)
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "critical=${critical:-0}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Trivy report"
+            echo
+            if [ "$total" -gt 0 ]; then
+              echo "**$total** findings (${critical:-0} critical): misconfigurations and secrets."
+              echo
+              # Stay under the 65536-character PR comment limit.
+              head -c 55000 trivy-report.md
+            else
+              echo "No findings."
+            fi
+            echo
+            echo "_Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}_"
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR_NUMBER" --body-file summary.md --edit-last --create-if-none
+
+      - name: Notify Telegram
+        if: always() && contains(format(',{0},', inputs.telegram-event-names), format(',{0},', github.event_name))
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          TOTAL: ${{ steps.report.outputs.total }}
+          CRITICAL: ${{ steps.report.outputs.critical }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "::notice::Telegram secrets not set, skipping notification."
+            exit 0
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ "$JOB_STATUS" != success ]; then
+            icon="⚠️"; text="scan failed to complete"
+          elif [ "${TOTAL:-0}" -gt 0 ]; then
+            icon="🔴"; text="${TOTAL} findings (${CRITICAL:-0} critical)"
+          else
+            icon="✅"; text="no findings"
+          fi
+          msg="${icon} <b>Trivy</b> ${GITHUB_REPOSITORY}: ${text}
+          <a href=\"${run_url}\">Report</a>"
+          args=(--data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${msg}" \
+                --data-urlencode "parse_mode=HTML" --data-urlencode "disable_web_page_preview=true")
+          [ -n "${THREAD_ID:-}" ] && args+=(--data-urlencode "message_thread_id=${THREAD_ID}")
+          curl -fsS -o /dev/null "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" "${args[@]}"
