@@ -1,0 +1,46 @@
+name: Telegram notify
+description: Send an HTML message to a Telegram chat, optionally into a forum topic.
+
+inputs:
+  bot-token:
+    description: Telegram bot token.
+    required: true
+  chat-id:
+    description: Target chat id.
+    required: true
+  thread-id:
+    description: Forum topic (message_thread_id). Empty for the main chat.
+    required: false
+    default: ''
+  message:
+    description: Message text. Telegram HTML subset is allowed.
+    required: true
+  link-text:
+    description: Text of the link to this workflow run. Empty to omit the link.
+    required: false
+    default: Report
+
+runs:
+  using: composite
+  steps:
+    - name: Send message
+      shell: bash
+      env:
+        BOT_TOKEN: ${{ inputs.bot-token }}
+        CHAT_ID: ${{ inputs.chat-id }}
+        THREAD_ID: ${{ inputs.thread-id }}
+        MESSAGE: ${{ inputs.message }}
+        LINK_TEXT: ${{ inputs.link-text }}
+      run: |
+        if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+          echo "::notice::Telegram bot token or chat id not set, skipping notification."
+          exit 0
+        fi
+        text="$MESSAGE"
+        if [ -n "$LINK_TEXT" ]; then
+          text="${text}"$'\n'"<a href=\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\">${LINK_TEXT}</a>"
+        fi
+        args=(--data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${text}" \
+              --data-urlencode "parse_mode=HTML" --data-urlencode "disable_web_page_preview=true")
+        [ -n "$THREAD_ID" ] && args+=(--data-urlencode "message_thread_id=${THREAD_ID}")
+        curl -fsS -o /dev/null "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" "${args[@]}"

@@ -2,16 +2,25 @@
 
 Reusable GitHub Actions workflows.
 
-## `trivy.yml`
+## `trivy.yml` (reusable workflow)
 
 Trivy scan for Kubernetes/Helm misconfigurations and secrets. Reports in the run
-summary, as a PR comment, and on Telegram for scheduled/manual runs.
+summary and as a PR comment. Outputs: `total`, `critical`, `outcome`.
+
+Inputs: `scan-ref` (default `.`), `severity` (default `HIGH,CRITICAL`).
+
+## `telegram-notify` (action)
+
+Generic Telegram message. Inputs: `bot-token`, `chat-id`, `message` (HTML),
+optional `thread-id` and `link-text` (link to the run, default `Report`).
+Skips quietly when token or chat id are empty.
+
+## Example
 
 ```yaml
 name: Trivy
 on:
   pull_request:
-    paths: ['k8s/**']
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
@@ -23,13 +32,21 @@ permissions:
 jobs:
   trivy:
     uses: petretiandrea/github-actions/.github/workflows/trivy.yml@v1
-    with:
-      scan-ref: k8s
-    secrets: inherit
+
+  notify:
+    needs: trivy
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: petretiandrea/github-actions/telegram-notify@v1
+        with:
+          bot-token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat-id: ${{ secrets.TELEGRAM_CHAT_ID }}
+          thread-id: ${{ secrets.TELEGRAM_THREAD_ID }}
+          message: >-
+            ${{ needs.trivy.outputs.outcome == 'success'
+            && format('🔐 <b>Trivy</b> {0}: {1} findings ({2} critical)', github.repository, needs.trivy.outputs.total, needs.trivy.outputs.critical)
+            || format('⚠️ <b>Trivy</b> {0}: scan did not complete', github.repository) }}
 ```
 
-Inputs: `scan-ref` (default `.`), `severity` (default `HIGH,CRITICAL`),
-`telegram-event-names` (default `schedule,workflow_dispatch`).
-
-Secrets (optional, set per repo or per organization): `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`, `TELEGRAM_THREAD_ID`. Without them the Telegram step is skipped.
+Secrets are set per repository or per organization.
